@@ -1,0 +1,10 @@
+^C:\AI_TSS-GENERATOR\BUILD_V15\CMAKEFILES\EBA98C1C0FE39BEEAACD2A49CEFD9488\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SC:/ai_TSS-generator -BC:/ai_TSS-generator/build_v15 --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file C:/ai_TSS-generator/build_v15/TSSGenerator.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

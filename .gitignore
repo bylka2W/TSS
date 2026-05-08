@@ -1,0 +1,8 @@
+build/
+*.exe
+*.lib
+*.obj
+*.pdb
+.vs/
+*.user
+*.suo
