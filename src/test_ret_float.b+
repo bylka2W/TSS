@@ -1,0 +1,26 @@
+state S {
+    my_float: float
+    my_int: int
+    tmp: int
+}
+
+export entry init {
+    my_float = 3.14159
+    my_int = 42
+}
+
+export entry set_float_a {
+    my_float = 1.5
+}
+
+export entry set_float_b {
+    my_float = 2.71828
+}
+
+export entry set_float_c {
+    my_float = 1.0 / 3.0
+}
+
+export entry set_float_add {
+    my_float = my_float + 1.0
+}

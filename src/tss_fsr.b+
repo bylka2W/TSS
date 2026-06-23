@@ -1,0 +1,34 @@
+state FSR {
+    accum_color: float
+    accum_weight: float
+    cur_color: float
+    alpha: float
+    frame_index: int
+    result: int
+}
+
+export entry FrameInit {
+    accum_color = 0.0
+    accum_weight = 0.0
+    frame_index = 0
+}
+
+export entry FrameProcess {
+    cur_color = 0.5
+    accum_weight = accum_weight + 1.0
+    alpha = min(1.0, 1.0 / accum_weight)
+    accum_color = accum_color * (1.0 - alpha) + cur_color * alpha
+    frame_index = frame_index + 1
+}
+
+export entry GetFrameIndex {
+    result = frame_index
+}
+
+export entry GetAccumWeightInt {
+    result = accum_weight
+}
+
+export entry GetAccumColorInt {
+    result = accum_color * 100.0
+}

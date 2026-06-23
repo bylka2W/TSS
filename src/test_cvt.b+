@@ -1,0 +1,14 @@
+state T {
+    a: int
+    b: float
+    c: int
+    d: float
+}
+
+export entry T {
+    a = 9
+    b = 3.0
+    c = a / 3
+    d = a
+    c = d / 2.0
+}

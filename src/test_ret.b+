@@ -1,0 +1,5 @@
+state S { x }
+
+export entry S {
+    x = 42
+}

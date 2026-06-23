@@ -1,0 +1,34 @@
+state FSR {
+    accum_color: float
+    accum_weight: float
+    cur_color: float
+    alpha: float
+    frame_index: int
+    result: int
+    history: image<f32>
+}
+
+export entry Init {
+    create_image(history, 4, 4)
+    history[0, 0] = 42.0
+    history[0, 1] = accum_color
+    frame_index = 1
+    accum_color = 0.5
+}
+
+export entry GetHistory00 {
+    result = history[0, 0]
+}
+
+export entry GetHistory01 {
+    result = history[0, 1]
+}
+
+export entry WriteHistory {
+    history[0, 0] = history[0, 0] + 1.0
+    result = history[0, 0]
+}
+
+export entry GetAccumColor {
+    return -> accum_color
+}

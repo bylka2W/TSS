@@ -1,0 +1,24 @@
+state T { ptr, val: float, result }
+
+export entry Init {
+    ptr = VirtualAlloc(0, 16, 0x1000, 0x04)
+    TlsSetValue(0, ptr)
+    *ptr = 0.5
+}
+
+export entry ReadFloat {
+    ptr = TlsGetValue(0)
+    val = *ptr
+    result = val * 100.0
+}
+
+export entry ReadRaw {
+    ptr = TlsGetValue(0)
+    result = *ptr
+}
+
+export entry ReadFloatDirect {
+    ptr = TlsGetValue(0)
+    val = *ptr
+    result = val * 2.0
+}

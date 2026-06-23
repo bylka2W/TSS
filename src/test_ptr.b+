@@ -1,0 +1,5 @@
+state TSS_Mem { x }
+
+export entry TSS_Mem {
+    x = 12345
+}
