@@ -1,0 +1,13 @@
+# Build artifacts
+Binaries/
+Intermediate/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.pdb
+*.exp
+*.lib
+
+# OS
+.DS_Store
+Thumbs.db

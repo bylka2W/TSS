@@ -1,0 +1,66 @@
+#include "/Engine/Private/Common.ush"
+#include "TSSCommon.ush"
+
+Texture2D<float4> RCASInputTex;
+RWTexture2D<float4> OutputColor;
+
+cbuffer TSSConstants : register(b0)
+{
+    int2 RenderSize;
+    int2 MaxRenderSize;
+    int2 DisplaySize;
+    int2 InputColorResourceDimensions;
+    int2 LumaMipDimensions;
+    int LumaMipLevelToUse;
+    int FrameIndex;
+    float4 DeviceToViewDepth;
+    float2 Jitter;
+    float2 MotionVectorScale;
+    float2 DownscaleFactor;
+    float2 MotionVectorJitterCancellation;
+    float PreExposure;
+    float PreviousFramePreExposure;
+    float TanHalfFOV;
+    float JitterSequenceLength;
+    float DeltaTime;
+    float DynamicResChangeFactor;
+    float ViewSpaceToMetersFactor;
+    float Sharpness;
+};
+
+void TSS_RCASFilter(int2 Pos)
+{
+    float3 Neighbors[4];
+    Neighbors[0] = RCASInputTex[int2(Pos.x, Pos.y - 1)].rgb;
+    Neighbors[1] = RCASInputTex[int2(Pos.x - 1, Pos.y)].rgb;
+    Neighbors[2] = RCASInputTex[int2(Pos.x + 1, Pos.y)].rgb;
+    Neighbors[3] = RCASInputTex[int2(Pos.x, Pos.y + 1)].rgb;
+
+    float3 Center = RCASInputTex[Pos].rgb;
+
+    float3 MinColor = min(Center, min(min(Neighbors[0], Neighbors[1]), min(Neighbors[2], Neighbors[3])));
+    float3 MaxColor = max(Center, max(max(Neighbors[0], Neighbors[1]), max(Neighbors[2], Neighbors[3])));
+
+    float3 ScaleFactor = saturate(min(abs(Center - MinColor) / (MaxColor - MinColor + 0.0001f), 1.0f));
+    ScaleFactor = (-ScaleFactor * ScaleFactor + 3.0f) * ScaleFactor - 2.0f;
+    ScaleFactor = max(float3(0, 0, 0), ScaleFactor);
+
+    float3 Weight = ScaleFactor * ScaleFactor * (3.0f - 2.0f * ScaleFactor);
+    float3 Sum = Weight * (Neighbors[0] + Neighbors[1] + Neighbors[2] + Neighbors[3]);
+    float3 Denom = 4.0f * Weight + (1.0f - 4.0f * Weight);
+
+    float3 Result = (Center + Sum) / max(Denom, 0.0001f);
+    Result = lerp(Center, Result, saturate(Sharpness * 4.0f));
+
+    OutputColor[Pos] = float4(Result, 1.0f);
+}
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 DTid : SV_DispatchThreadID)
+{
+    int2 Pos = int2(DTid.xy);
+    if (TSS_IsOnScreen(Pos, DisplaySize))
+    {
+        TSS_RCASFilter(Pos);
+    }
+}

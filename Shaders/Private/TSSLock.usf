@@ -1,0 +1,112 @@
+#include "/Engine/Private/Common.ush"
+#include "TSSCommon.ush"
+
+Texture2D<float> LockInputLumaTex;
+RWTexture2D<unorm float> NewLocks;
+RWTexture2D<uint> ReconstructedPrevDepth;
+
+cbuffer TSSConstants : register(b0)
+{
+    int2 RenderSize;
+    int2 MaxRenderSize;
+    int2 DisplaySize;
+    int2 InputColorResourceDimensions;
+    int2 LumaMipDimensions;
+    int LumaMipLevelToUse;
+    int FrameIndex;
+    float4 DeviceToViewDepth;
+    float2 Jitter;
+    float2 MotionVectorScale;
+    float2 DownscaleFactor;
+    float2 MotionVectorJitterCancellation;
+    float PreExposure;
+    float PreviousFramePreExposure;
+    float TanHalfFOV;
+    float JitterSequenceLength;
+    float DeltaTime;
+    float DynamicResChangeFactor;
+    float ViewSpaceToMetersFactor;
+};
+
+bool TSS_ComputeThinFeatureConfidence(int2 Pos)
+{
+    const int RADIUS = 1;
+    float Nucleus = LockInputLumaTex[Pos];
+    float SimilarThreshold = 1.05f;
+    float DissimilarLumaMin = TSS_FLT_MAX;
+    float DissimilarLumaMax = 0;
+
+    uint Mask = (1U << 4);
+
+    const uint RejectionMasks[4] = {
+        (1U << 0) | (1U << 1) | (1U << 3) | (1U << 4),
+        (1U << 1) | (1U << 2) | (1U << 4) | (1U << 5),
+        (1U << 3) | (1U << 4) | (1U << 6) | (1U << 7),
+        (1U << 4) | (1U << 5) | (1U << 7) | (1U << 8),
+    };
+
+    int Idx = 0;
+    for (int y = -RADIUS; y <= RADIUS; y++)
+    {
+        for (int x = -RADIUS; x <= RADIUS; x++, Idx++)
+        {
+            if (x == 0 && y == 0) continue;
+
+            int2 SamplePos = TSS_ClampLoad(Pos, int2(x, y), int2(RenderSize));
+            float SampleLuma = LockInputLumaTex[SamplePos];
+            float Difference = max(SampleLuma, Nucleus) / max(min(SampleLuma, Nucleus), 0.0001f);
+
+            if (Difference > 0 && (Difference < SimilarThreshold))
+            {
+                Mask |= (1U << Idx);
+            }
+            else
+            {
+                DissimilarLumaMin = min(DissimilarLumaMin, SampleLuma);
+                DissimilarLumaMax = max(DissimilarLumaMax, SampleLuma);
+            }
+        }
+    }
+
+    bool IsRidge = Nucleus > DissimilarLumaMax || Nucleus < DissimilarLumaMin;
+    if (!IsRidge) return false;
+
+    for (int i = 0; i < 4; i++)
+    {
+        if ((Mask & RejectionMasks[i]) == RejectionMasks[i])
+            return false;
+    }
+
+    return true;
+}
+
+int2 TSS_ComputeHrPosFromLrPos(int2 PxLrPos)
+{
+    float2 SrcJitteredPos = float2(PxLrPos) + 0.5f - Jitter;
+    float2 LrPosInHr = (SrcJitteredPos / float2(RenderSize)) * float2(DisplaySize);
+    int2 PxHrPos = int2(floor(LrPosInHr));
+    return PxHrPos;
+}
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 DTid : SV_DispatchThreadID)
+{
+    int2 PxLrPos = int2(DTid.xy);
+
+    if (all(PxLrPos < RenderSize))
+    {
+        TSS_SetReconstructedDepth(ReconstructedPrevDepth, PxLrPos, 0x3f800000);
+    }
+
+    if (TSS_IsOnScreen(PxLrPos, RenderSize))
+    {
+        if (TSS_ComputeThinFeatureConfidence(PxLrPos))
+        {
+            int2 PxHrPos = TSS_ComputeHrPosFromLrPos(PxLrPos);
+            if (TSS_IsOnScreen(PxHrPos, DisplaySize))
+            {
+                NewLocks[PxHrPos] = 1.0f;
+            }
+        }
+    }
+}

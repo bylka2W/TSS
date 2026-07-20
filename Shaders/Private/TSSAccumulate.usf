@@ -1,0 +1,251 @@
+#include "/Engine/Private/Common.ush"
+#include "TSSCommon.ush"
+
+Texture2D<float4> PreparedInputColorTex;
+Texture2D<float2> DilatedReactiveMasksTex;
+Texture2D<float4> InputMotionVectorsTex;
+Texture2D<float2> LockStatusTex;
+Texture2D<float4> InternalUpscaledColorTex;
+Texture2D<float> SceneLuminanceMipsTex;
+Texture2D<float2> AutoExposureTex;
+Texture2D<float4> LumaHistoryTex;
+Texture2D<unorm float> NewLocksTex;
+
+RWTexture2D<float4> InternalUpscaledOut;
+RWTexture2D<float2> LockStatusOut;
+RWTexture2D<float4> LumaHistoryOut;
+RWTexture2D<float4> UpscaledOutput;
+
+SamplerState LinearClampSampler : register(s0);
+
+cbuffer TSSConstants : register(b0)
+{
+    int2 RenderSize;
+    int2 MaxRenderSize;
+    int2 DisplaySize;
+    int2 InputColorResourceDimensions;
+    int2 LumaMipDimensions;
+    int LumaMipLevelToUse;
+    int FrameIndex;
+    float4 DeviceToViewDepth;
+    float2 Jitter;
+    float2 MotionVectorScale;
+    float2 DownscaleFactor;
+    float2 MotionVectorJitterCancellation;
+    float PreExposure;
+    float PreviousFramePreExposure;
+    float TanHalfFOV;
+    float JitterSequenceLength;
+    float DeltaTime;
+    float DynamicResChangeFactor;
+    float ViewSpaceToMetersFactor;
+};
+
+struct AccumulationParams
+{
+    int2 PxHrPos;
+    float2 HrUV;
+    float2 LrUV_HwSampler;
+    float2 MotionVector;
+    float2 ReprojectedHrUV;
+    float HrVelocity;
+    float DepthClipFactor;
+    float DilatedReactiveFactor;
+    float AccumulationMask;
+    bool bIsResetFrame;
+    bool bIsExistingSample;
+    bool bIsNewSample;
+};
+
+float2 TSS_LoadInputMotionVector(int2 Pos)
+{
+    float2 MV = InputMotionVectorsTex[Pos].xy;
+    float2 UVMV = MV * MotionVectorScale;
+    UVMV -= MotionVectorJitterCancellation;
+    return UVMV;
+}
+
+float2 TSS_GetMotionVector(int2 PxHrPos, float2 HrUV)
+{
+    return TSS_LoadInputMotionVector(PxHrPos);
+}
+
+bool TSS_IsUvInside(float2 UV)
+{
+    return (UV.x >= 0.0f && UV.x <= 1.0f) && (UV.y >= 0.0f && UV.y <= 1.0f);
+}
+
+AccumulationParams TSS_InitParams(int2 PxHrPos)
+{
+    AccumulationParams Params;
+    Params.PxHrPos = PxHrPos;
+
+    float2 HrUV = (float2(PxHrPos) + 0.5f) / float2(DisplaySize);
+    Params.HrUV = HrUV;
+
+    float2 LrUVJittered = HrUV + Jitter / float2(RenderSize);
+    Params.LrUV_HwSampler = TSS_ClampUv(LrUVJittered, RenderSize, MaxRenderSize);
+
+    Params.MotionVector = TSS_GetMotionVector(PxHrPos, HrUV);
+    Params.HrVelocity = TSS_GetPxHrVelocity(Params.MotionVector, float2(DisplaySize));
+
+    Params.ReprojectedHrUV = HrUV + Params.MotionVector;
+    Params.bIsExistingSample = TSS_IsUvInside(Params.ReprojectedHrUV);
+
+    Params.DepthClipFactor = saturate(PreparedInputColorTex.SampleLevel(LinearClampSampler, Params.LrUV_HwSampler, 0).w);
+
+    float2 DilatedRM = DilatedReactiveMasksTex.SampleLevel(LinearClampSampler, Params.LrUV_HwSampler, 0);
+    Params.DilatedReactiveFactor = DilatedRM.x;
+    Params.AccumulationMask = DilatedRM.y;
+    Params.bIsResetFrame = (FrameIndex == 0);
+    Params.bIsNewSample = (!Params.bIsExistingSample || Params.bIsResetFrame);
+
+    return Params;
+}
+
+float4 TSS_ComputeUpsampledColorAndWeight(AccumulationParams Params, out TSSRectificationBox ClippingBox, float ReactiveFactor)
+{
+    TSS_RectificationBoxReset(ClippingBox);
+
+    float2 DstOutputPos = float2(Params.PxHrPos) + float2(0.5f, 0.5f);
+    float2 SrcOutputPos = DstOutputPos * DownscaleFactor;
+    int2 SrcInputPos = int2(floor(SrcOutputPos));
+
+    float2 SrcUnjitteredPos = (float2(SrcInputPos) + float2(0.5f, 0.5f)) - Jitter;
+
+    int2 OffsetTL;
+    OffsetTL.x = (SrcUnjitteredPos.x > SrcOutputPos.x) ? -2 : -1;
+    OffsetTL.y = (SrcUnjitteredPos.y > SrcOutputPos.y) ? -2 : -1;
+
+    bool bFlipRow = SrcUnjitteredPos.y > SrcOutputPos.y;
+    bool bFlipCol = SrcUnjitteredPos.x > SrcOutputPos.x;
+
+    float3 Samples[9];
+
+    for (int Row = 0; Row < 3; Row++)
+    {
+        for (int Col = 0; Col < 3; Col++)
+        {
+            int SampleIndex = Col + (Row * 3);
+            int2 SampleColRow = int2(bFlipCol ? (2 - Col) : Col, bFlipRow ? (2 - Row) : Row);
+            int2 SrcSamplePos = SrcInputPos + OffsetTL + SampleColRow;
+            int2 SampleCoord = TSS_ClampLoad(SrcSamplePos, int2(0, 0), RenderSize);
+
+            Samples[SampleIndex] = PreparedInputColorTex[SampleCoord].xyz;
+        }
+    }
+
+    float4 ColorAndWeight = float4(0, 0, 0, 0);
+    float2 BaseSampleOffset = SrcUnjitteredPos - SrcOutputPos;
+
+    float KernelReactiveFactor = max(ReactiveFactor, float(Params.bIsNewSample));
+    float KernelBiasMax = min(1.99f, (1.0f + (1.0f / DownscaleFactor.x - 1.0f)) * 1.0f) * (1.0f - KernelReactiveFactor);
+    float KernelBiasMin = max(1.0f, ((1.0f + KernelBiasMax) * 0.3f));
+    float KernelBiasFactor = max(0.0f, max(0.25f * Params.DepthClipFactor, KernelReactiveFactor));
+    float KernelBias = lerp(KernelBiasMax, KernelBiasMin, KernelBiasFactor);
+
+    float RectificationCurveBias = lerp(-2.0f, -3.0f, saturate(Params.HrVelocity / 50.0f));
+
+    for (int R = 0; R < 3; R++)
+    {
+        for (int C = 0; C < 3; C++)
+        {
+            int SampleIndex = C + (R * 3);
+            int2 SampleColRow2 = int2(bFlipCol ? (2 - C) : C, bFlipRow ? (2 - R) : R);
+            float2 Offset = float2(OffsetTL) + float2(SampleColRow2);
+            float2 SrcSampleOffset = BaseSampleOffset + Offset;
+
+            int2 SrcSamplePos2 = SrcInputPos + OffsetTL + SampleColRow2;
+            float OnScreenFactor = float(TSS_IsOnScreen(SrcSamplePos2, RenderSize));
+
+            float OffsetLenSq = dot(SrcSampleOffset, SrcSampleOffset);
+            float SampleWeight = OnScreenFactor * TSS_Lanczos2Approx(max(OffsetLenSq * KernelBias * KernelBias, 0.0f));
+
+            ColorAndWeight += float4(Samples[SampleIndex] * SampleWeight, SampleWeight);
+
+            {
+                float BoxSampleWeight = exp(RectificationCurveBias * OffsetLenSq);
+                bool bInitialSample = (R == 0) && (C == 0);
+                TSS_RectificationBoxAddSample(bInitialSample, ClippingBox, Samples[SampleIndex], BoxSampleWeight);
+            }
+        }
+    }
+
+    TSS_RectificationBoxComputeVarianceBoxData(ClippingBox);
+
+    ColorAndWeight.w *= float(ColorAndWeight.w > TSS_EPSILON);
+
+    if (ColorAndWeight.w > TSS_EPSILON)
+    {
+        ColorAndWeight.xyz = ColorAndWeight.xyz / ColorAndWeight.w;
+        ColorAndWeight.w *= TSS_UPSAMPLE_LANCZOS_WEIGHT_SCALE;
+
+        ColorAndWeight.xyz = clamp(ColorAndWeight.xyz, ClippingBox.AabbMin, ClippingBox.AabbMax);
+    }
+
+    return ColorAndWeight;
+}
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 DTid : SV_DispatchThreadID)
+{
+    int2 PxHrPos = int2(DTid.xy);
+    if (!TSS_IsOnScreen(PxHrPos, DisplaySize))
+        return;
+
+    AccumulationParams Params = TSS_InitParams(PxHrPos);
+
+    float3 HistoryColor = float3(0, 0, 0);
+    float2 LockStatus = float2(0, 0);
+    float TemporalReactiveFactor = 0.0f;
+
+    float4 HistorySample = InternalUpscaledColorTex.SampleLevel(LinearClampSampler, Params.ReprojectedHrUV, 0);
+    if (Params.bIsExistingSample && !Params.bIsResetFrame)
+    {
+        HistoryColor = TSS_PrepareRgb(HistorySample.rgb, 1.0f, PreviousFramePreExposure);
+        HistoryColor = TSS_RGBToYCoCg(HistoryColor);
+        TemporalReactiveFactor = saturate(abs(HistorySample.w));
+
+        LockStatus = LockStatusTex.SampleLevel(LinearClampSampler, Params.ReprojectedHrUV, 0);
+    }
+
+    float ThisFrameReactiveFactor = max(Params.DilatedReactiveFactor, TemporalReactiveFactor);
+
+    TSSRectificationBox ClippingBox;
+    float4 UpsampledColorAndWeight = TSS_ComputeUpsampledColorAndWeight(Params, ClippingBox, ThisFrameReactiveFactor);
+
+    float BaseAccumulation = TSS_MAX_ACCUMULATION_LANCZOS_WEIGHT * float(Params.bIsExistingSample) * (1.0f - ThisFrameReactiveFactor) * (1.0f - Params.DepthClipFactor);
+    BaseAccumulation = min(BaseAccumulation, lerp(BaseAccumulation, UpsampledColorAndWeight.w * 10.0f, max(0.0f, saturate(Params.HrVelocity * 10.0f))));
+    BaseAccumulation = min(BaseAccumulation, lerp(BaseAccumulation, UpsampledColorAndWeight.w, saturate(Params.HrVelocity / 20.0f)));
+    float3 Accumulation = BaseAccumulation.xxx;
+
+    if (Params.bIsNewSample)
+    {
+        HistoryColor = TSS_YCoCgToRGB(UpsampledColorAndWeight.xyz);
+    }
+    else
+    {
+        float3 ScaledBoxVec = ClippingBox.BoxVec * lerp(1.0f, 1.0f, saturate(max(Params.DepthClipFactor, max(Params.AccumulationMask, saturate(Params.HrVelocity / 20.0f)))));
+        float3 BoxMin = max(ClippingBox.AabbMin, ClippingBox.BoxCenter - ScaledBoxVec);
+        float3 BoxMax = min(ClippingBox.AabbMax, ClippingBox.BoxCenter + ScaledBoxVec);
+
+        if (any(HistoryColor < BoxMin) || any(HistoryColor > BoxMax))
+        {
+            float3 ClampedHistory = clamp(HistoryColor, BoxMin, BoxMax);
+            HistoryColor = lerp(ClampedHistory, HistoryColor, saturate(max(Params.AccumulationMask, ThisFrameReactiveFactor)));
+            Accumulation = lerp(min(Accumulation, 0.1f.xxx), Accumulation, saturate(max(Params.AccumulationMask, ThisFrameReactiveFactor)));
+        }
+
+        float3 AccumMax = max(TSS_EPSILON.xxx, Accumulation + UpsampledColorAndWeight.www);
+        float3 Alpha = UpsampledColorAndWeight.www / AccumMax;
+        HistoryColor = lerp(HistoryColor, UpsampledColorAndWeight.xyz, Alpha);
+        HistoryColor = TSS_YCoCgToRGB(HistoryColor);
+    }
+
+    HistoryColor = TSS_UnprepareRgb(HistoryColor, 1.0f);
+
+    InternalUpscaledOut[PxHrPos] = float4(HistoryColor, TemporalReactiveFactor);
+    UpscaledOutput[PxHrPos] = float4(HistoryColor, 1.0f);
+    LockStatusOut[PxHrPos] = LockStatus;
+    LumaHistoryOut[PxHrPos] = LumaHistoryTex[PxHrPos];
+}

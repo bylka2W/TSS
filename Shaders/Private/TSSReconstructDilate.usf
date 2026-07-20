@@ -1,0 +1,137 @@
+#include "/Engine/Private/Common.ush"
+#include "TSSCommon.ush"
+
+Texture2D<float4> InputDepthTex;
+Texture2D<float4> InputColorTex;
+Texture2D<float4> InputMotionVectorsTex;
+
+RWTexture2D<uint> ReconstructedPrevDepth;
+RWTexture2D<float2> DilatedMotionVectors;
+RWTexture2D<float> DilatedDepth;
+RWTexture2D<float> LockInputLuma;
+
+cbuffer TSSConstants : register(b0)
+{
+    int2 RenderSize;
+    int2 MaxRenderSize;
+    int2 DisplaySize;
+    int2 InputColorResourceDimensions;
+    int2 LumaMipDimensions;
+    int LumaMipLevelToUse;
+    int FrameIndex;
+    float4 DeviceToViewDepth;
+    float2 Jitter;
+    float2 MotionVectorScale;
+    float2 DownscaleFactor;
+    float2 MotionVectorJitterCancellation;
+    float PreExposure;
+    float PreviousFramePreExposure;
+    float TanHalfFOV;
+    float JitterSequenceLength;
+    float DeltaTime;
+    float DynamicResChangeFactor;
+    float ViewSpaceToMetersFactor;
+};
+
+int2 ComputeHrPosFromLrPos(int2 PxLrPos)
+{
+    float2 SrcJitteredPos = float2(PxLrPos) + 0.5f - Jitter;
+    float2 LrPosInHr = (SrcJitteredPos / float2(RenderSize)) * float2(DisplaySize);
+    int2 PxHrPos = int2(floor(LrPosInHr));
+    return PxHrPos;
+}
+
+float2 TSS_LoadInputMotionVector(int2 Pos)
+{
+    float2 MV = InputMotionVectorsTex[Pos].xy;
+    float2 UVMV = MV * MotionVectorScale;
+    UVMV -= MotionVectorJitterCancellation;
+    return UVMV;
+}
+
+void TSS_FindNearestDepth(int2 PxPos, out float NearestDepth, out int2 NearestDepthCoord)
+{
+    const int2 Offsets[9] = {
+        int2(+0, +0), int2(+1, +0), int2(+0, +1),
+        int2(+0, -1), int2(-1, +0), int2(-1, +1),
+        int2(+1, +1), int2(-1, -1), int2(+1, -1)
+    };
+
+    float Depths[9];
+    for (int i = 0; i < 9; i++)
+    {
+        int2 Pos = PxPos + Offsets[i];
+        Depths[i] = (Pos.x >= 0 && Pos.y >= 0 && Pos.x < RenderSize.x && Pos.y < RenderSize.y)
+            ? InputDepthTex[Pos].r : 1.0f;
+    }
+
+    NearestDepthCoord = PxPos;
+    NearestDepth = Depths[0];
+    for (int j = 1; j < 9; j++)
+    {
+        int2 Pos = PxPos + Offsets[j];
+        if (TSS_IsOnScreen(Pos, RenderSize))
+        {
+            if (Depths[j] < NearestDepth)
+            {
+                NearestDepthCoord = Pos;
+                NearestDepth = Depths[j];
+            }
+        }
+    }
+}
+
+void TSS_ReconstructPrevDepth(int2 PxPos, float Depth, float2 MotionVector)
+{
+    MotionVector *= float(length(MotionVector * DisplaySize) > 0.1f);
+
+    float2 UV = (PxPos + 0.5) / float2(RenderSize);
+    float2 ReprojectedUV = UV + MotionVector;
+
+    TSSBilinearSamplingData BilinearInfo = TSS_GetBilinearSamplingData(ReprojectedUV, RenderSize);
+
+    for (int i = 0; i < 4; i++)
+    {
+        float Weight = BilinearInfo.Weights[i];
+        if (Weight > TSS_RECONSTRUCTED_DEPTH_BILINEAR_WEIGHT_THRESHOLD)
+        {
+            int2 StorePos = BilinearInfo.BasePos + BilinearInfo.Offsets[i];
+            if (TSS_IsOnScreen(StorePos, RenderSize))
+            {
+                TSS_StoreReconstructedDepth(ReconstructedPrevDepth, StorePos, Depth);
+            }
+        }
+    }
+}
+
+float TSS_ComputeLockInputLuma(int2 PxPos)
+{
+    float3 RGB = max(float3(0, 0, 0), InputColorTex[PxPos].rgb);
+    RGB /= max(PreExposure, 0.0001f);
+    float LockInputLuma = pow(TSS_RGBToPerceivedLuma(RGB), 1.0f / 6.0f);
+    return LockInputLuma;
+}
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 DTid : SV_DispatchThreadID)
+{
+    int2 PxLrPos = int2(DTid.xy);
+    if (!TSS_IsOnScreen(PxLrPos, RenderSize))
+        return;
+
+    float NearestDepth;
+    int2 NearestDepthCoord;
+    TSS_FindNearestDepth(PxLrPos, NearestDepth, NearestDepthCoord);
+
+    int2 MVPos = ComputeHrPosFromLrPos(NearestDepthCoord);
+
+    float2 DilatedMV = TSS_LoadInputMotionVector(MVPos);
+
+    DilatedDepth[PxLrPos] = NearestDepth;
+    DilatedMotionVectors[PxLrPos] = DilatedMV;
+
+    TSS_ReconstructPrevDepth(PxLrPos, NearestDepth, DilatedMV);
+
+    float LockLuma = TSS_ComputeLockInputLuma(PxLrPos);
+    LockInputLuma[PxLrPos] = LockLuma;
+}

@@ -1,0 +1,286 @@
+#pragma once
+
+#include "/Engine/Private/Common.ush"
+
+static const float TSS_EPSILON = 1e-03f;
+static const float TSS_FLT_MAX = 3.402823466e+38f;
+static const float TSS_FP16_MAX = 65504.0f;
+static const float TSS_PI = 3.141592653589793f;
+
+static const float TSS_RECONSTRUCTED_DEPTH_BILINEAR_WEIGHT_THRESHOLD = 0.01f;
+static const float TSS_UPSAMPLE_LANCZOS_WEIGHT_SCALE = 1.0f / 12.0f;
+static const float TSS_MAX_ACCUMULATION_LANCZOS_WEIGHT = 1.0f;
+static const float TSS_AVERAGE_LANCZOS_WEIGHT_PER_FRAME = 0.74f * TSS_UPSAMPLE_LANCZOS_WEIGHT_SCALE;
+static const float TSS_ACCUMULATION_MAX_ON_MOTION = 3.0f * TSS_UPSAMPLE_LANCZOS_WEIGHT_SCALE;
+static const float TSS_RESET_AUTO_EXPOSURE_AVERAGE_SMOOTHING = 1e8f;
+
+#define TSS_LOCK_LIFETIME_REMAINING 0
+#define TSS_LOCK_TEMPORAL_LUMA 1
+
+#define TSS_SHADING_CHANGE_MIP_LEVEL 4
+
+float TSS_Luminance(float3 Color)
+{
+    return dot(Color, float3(0.2126, 0.7152, 0.0722));
+}
+
+float3 TSS_RGBToYCoCg(float3 Color)
+{
+    return float3(
+        0.25f * Color.r + 0.5f * Color.g + 0.25f * Color.b,
+        0.5f * Color.r - 0.5f * Color.b,
+        -0.25f * Color.r + 0.5f * Color.g - 0.25f * Color.b);
+}
+
+float3 TSS_YCoCgToRGB(float3 YCoCg)
+{
+    return float3(
+        YCoCg.x + YCoCg.y - YCoCg.z,
+        YCoCg.x + YCoCg.z,
+        YCoCg.x - YCoCg.y - YCoCg.z);
+}
+
+float TSS_RGBToLuma(float3 LinearRGB)
+{
+    return dot(LinearRGB, float3(0.2126f, 0.7152f, 0.0722f));
+}
+
+float TSS_RGBToPerceivedLuma(float3 LinearRGB)
+{
+    float Luminance = TSS_RGBToLuma(LinearRGB);
+    float PerceivedLuminance = 0;
+    if (Luminance <= 216.0f / 24389.0f)
+    {
+        PerceivedLuminance = Luminance * (24389.0f / 27.0f);
+    }
+    else
+    {
+        PerceivedLuminance = pow(Luminance, 1.0f / 3.0f) * 116.0f - 16.0f;
+    }
+    return PerceivedLuminance * 0.01f;
+}
+
+float3 TSS_Tonemap(float3 RGB)
+{
+    return RGB / (max(max(0.f, RGB.r), max(RGB.g, RGB.b)) + 1.f).xxx;
+}
+
+float3 TSS_InverseTonemap(float3 RGB)
+{
+    return RGB / max(TSS_FP16_MAX, 1.f - max(RGB.r, max(RGB.g, RGB.b))).xxx;
+}
+
+float3 TSS_PrepareRgb(float3 RGB, float Exposure, float PreExposure)
+{
+    RGB /= PreExposure;
+    RGB *= Exposure;
+    RGB = clamp(RGB, 0.0f, TSS_FP16_MAX);
+    return RGB;
+}
+
+float3 TSS_UnprepareRgb(float3 RGB, float Exposure)
+{
+    RGB /= Exposure;
+    return RGB;
+}
+
+float TSS_ComputeAutoExposureFromLavg(float Lavg)
+{
+    Lavg = exp(Lavg);
+    const float S = 100.0f;
+    const float K = 12.5f;
+    float ExposureISO100 = log2((Lavg * S) / K);
+    const float q = 0.65f;
+    float Lmax = (78.0f / (q * S)) * pow(2.0f, ExposureISO100);
+    return 1.0f / Lmax;
+}
+
+float2 TSS_UVFromPixel(float2 PixelPos, float2 Resolution)
+{
+    return (PixelPos + 0.5) / Resolution;
+}
+
+int2 TSS_ClampLoad(int2 PxSample, int2 PxOffset, int2 TextureSize)
+{
+    int2 Result = PxSample + PxOffset;
+    Result.x = (PxOffset.x < 0) ? max(Result.x, 0) : Result.x;
+    Result.x = (PxOffset.x > 0) ? min(Result.x, TextureSize.x - 1) : Result.x;
+    Result.y = (PxOffset.y < 0) ? max(Result.y, 0) : Result.y;
+    Result.y = (PxOffset.y > 0) ? min(Result.y, TextureSize.y - 1) : Result.y;
+    return Result;
+}
+
+float2 TSS_ClampUv(float2 UV, int2 TextureSize, int2 ResourceSize)
+{
+    float2 SampleLocation = UV * TextureSize;
+    float2 ClampedLocation = max(float2(0.5f, 0.5f), min(SampleLocation, float2(TextureSize) - float2(0.5f, 0.5f)));
+    float2 ClampedUV = ClampedLocation / float2(ResourceSize);
+    return ClampedUV;
+}
+
+bool TSS_IsOnScreen(int2 Pos, int2 Size)
+{
+    return all(Pos >= 0) && all(Pos < Size);
+}
+
+float TSS_GetViewSpaceDepth(float DeviceDepth, float4 DeviceToViewDepth)
+{
+    return (DeviceToViewDepth[1] / (DeviceDepth - DeviceToViewDepth[0]));
+}
+
+float TSS_GetViewSpaceDepthInMeters(float DeviceDepth, float4 DeviceToViewDepth, float ViewSpaceToMetersFactor)
+{
+    return TSS_GetViewSpaceDepth(DeviceDepth, DeviceToViewDepth) * ViewSpaceToMetersFactor;
+}
+
+float2 TSS_ComputeNDC(float2 PxPos, int2 Size)
+{
+    return PxPos / float2(Size) * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f);
+}
+
+float3 TSS_GetViewSpacePosition(int2 ViewportPos, int2 ViewportSize, float DeviceDepth, float4 DeviceToViewDepth)
+{
+    float Z = TSS_GetViewSpaceDepth(DeviceDepth, DeviceToViewDepth);
+    float2 NdcPos = TSS_ComputeNDC(float2(ViewportPos), ViewportSize);
+    float X = DeviceToViewDepth[2] * NdcPos.x * Z;
+    float Y = DeviceToViewDepth[3] * NdcPos.y * Z;
+    return float3(X, Y, Z);
+}
+
+float TSS_MinDividedByMax(float V0, float V1)
+{
+    float M = max(V0, V1);
+    return M != 0 ? min(V0, V1) / M : 0;
+}
+
+struct TSSBilinearSamplingData
+{
+    int2 Offsets[4];
+    float Weights[4];
+    int2 BasePos;
+};
+
+TSSBilinearSamplingData TSS_GetBilinearSamplingData(float2 UV, int2 Size)
+{
+    TSSBilinearSamplingData Data;
+    float2 PxSample = (UV * Size) - float2(0.5f, 0.5f);
+    Data.BasePos = int2(floor(PxSample));
+    float2 PxFrac = frac(PxSample);
+
+    Data.Offsets[0] = int2(0, 0);
+    Data.Offsets[1] = int2(1, 0);
+    Data.Offsets[2] = int2(0, 1);
+    Data.Offsets[3] = int2(1, 1);
+
+    Data.Weights[0] = (1 - PxFrac.x) * (1 - PxFrac.y);
+    Data.Weights[1] = (PxFrac.x) * (1 - PxFrac.y);
+    Data.Weights[2] = (1 - PxFrac.x) * (PxFrac.y);
+    Data.Weights[3] = (PxFrac.x) * (PxFrac.y);
+
+    return Data;
+}
+
+struct TSSRectificationBox
+{
+    float3 BoxCenter;
+    float3 BoxVec;
+    float3 AabbMin;
+    float3 AabbMax;
+    float BoxCenterWeight;
+};
+
+void TSS_RectificationBoxReset(inout TSSRectificationBox Box)
+{
+    Box.BoxCenterWeight = 0;
+    Box.BoxCenter = float3(0, 0, 0);
+    Box.BoxVec = float3(0, 0, 0);
+    Box.AabbMin = float3(TSS_FLT_MAX, TSS_FLT_MAX, TSS_FLT_MAX);
+    Box.AabbMax = -float3(TSS_FLT_MAX, TSS_FLT_MAX, TSS_FLT_MAX);
+}
+
+void TSS_RectificationBoxAddInitialSample(inout TSSRectificationBox Box, float3 ColorSample, float SampleWeight)
+{
+    Box.AabbMin = ColorSample;
+    Box.AabbMax = ColorSample;
+    float3 WeightedSample = ColorSample * SampleWeight;
+    Box.BoxCenter = WeightedSample;
+    Box.BoxVec = ColorSample * WeightedSample;
+    Box.BoxCenterWeight = SampleWeight;
+}
+
+void TSS_RectificationBoxAddSample(bool bInitialSample, inout TSSRectificationBox Box, float3 ColorSample, float SampleWeight)
+{
+    if (bInitialSample)
+    {
+        TSS_RectificationBoxAddInitialSample(Box, ColorSample, SampleWeight);
+    }
+    else
+    {
+        Box.AabbMin = min(Box.AabbMin, ColorSample);
+        Box.AabbMax = max(Box.AabbMax, ColorSample);
+        float3 WeightedSample = ColorSample * SampleWeight;
+        Box.BoxCenter += WeightedSample;
+        Box.BoxVec += ColorSample * WeightedSample;
+        Box.BoxCenterWeight += SampleWeight;
+    }
+}
+
+void TSS_RectificationBoxComputeVarianceBoxData(inout TSSRectificationBox Box)
+{
+    Box.BoxCenterWeight = (abs(Box.BoxCenterWeight) > TSS_EPSILON ? Box.BoxCenterWeight : 1.f);
+    Box.BoxCenter /= Box.BoxCenterWeight;
+    Box.BoxVec /= Box.BoxCenterWeight;
+    float3 StdDev = sqrt(abs(Box.BoxVec - Box.BoxCenter * Box.BoxCenter));
+    Box.BoxVec = StdDev;
+}
+
+float TSS_Lanczos2NoClamp(float X)
+{
+    return abs(X) < TSS_EPSILON ? 1.f : (sin(TSS_PI * X) / (TSS_PI * X)) * (sin(0.5f * TSS_PI * X) / (0.5f * TSS_PI * X));
+}
+
+float TSS_Lanczos2(float X)
+{
+    X = min(abs(X), 2.0f);
+    return TSS_Lanczos2NoClamp(X);
+}
+
+float TSS_Lanczos2ApproxSqNoClamp(float X2)
+{
+    float A = (2.0f / 5.0f) * X2 - 1;
+    float B = (1.0f / 4.0f) * X2 - 1;
+    return ((25.0f / 16.0f) * A * A - (25.0f / 16.0f - 1)) * (B * B);
+}
+
+float TSS_Lanczos2ApproxSq(float X2)
+{
+    X2 = min(X2, 4.0f);
+    return TSS_Lanczos2ApproxSqNoClamp(X2);
+}
+
+float TSS_Lanczos2ApproxNoClamp(float X)
+{
+    return TSS_Lanczos2ApproxSqNoClamp(X * X);
+}
+
+float TSS_Lanczos2Approx(float X)
+{
+    return TSS_Lanczos2ApproxSq(X * X);
+}
+
+float TSS_GetPxHrVelocity(float2 MotionVector, float2 DisplaySize)
+{
+    return length(MotionVector * DisplaySize);
+}
+
+void TSS_StoreReconstructedDepth(RWTexture2D<uint> RWDepth, int2 PxSample, float Depth)
+{
+    uint uDepth = asuint(Depth);
+    uint dummy;
+    InterlockedMin(RWDepth[PxSample], uDepth, dummy);
+}
+
+void TSS_SetReconstructedDepth(RWTexture2D<uint> RWDepth, int2 PxSample, uint Value)
+{
+    RWDepth[PxSample] = Value;
+}

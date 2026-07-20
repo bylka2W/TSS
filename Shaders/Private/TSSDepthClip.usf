@@ -1,0 +1,272 @@
+#include "/Engine/Private/Common.ush"
+#include "TSSCommon.ush"
+
+Texture2D<uint> ReconstructedPrevDepthTex;
+Texture2D<float4> DilatedMotionVectorsTex;
+Texture2D<float> DilatedDepthTex;
+Texture2D<float> ReactiveMaskTex;
+Texture2D<float> TransparencyCompositionMaskTex;
+Texture2D<float4> PrevDilatedMotionVectorsTex;
+Texture2D<float4> InputMotionVectorsTex;
+Texture2D<float4> InputColorTex;
+Texture2D<float> InputDepthTex;
+
+RWTexture2D<float4> DilatedReactiveMasks;
+RWTexture2D<float4> PreparedInputColor;
+
+SamplerState LinearClampSampler : register(s0);
+
+cbuffer TSSConstants : register(b0)
+{
+    int2 RenderSize;
+    int2 MaxRenderSize;
+    int2 DisplaySize;
+    int2 InputColorResourceDimensions;
+    int2 LumaMipDimensions;
+    int LumaMipLevelToUse;
+    int FrameIndex;
+    float4 DeviceToViewDepth;
+    float2 Jitter;
+    float2 MotionVectorScale;
+    float2 DownscaleFactor;
+    float2 MotionVectorJitterCancellation;
+    float PreExposure;
+    float PreviousFramePreExposure;
+    float TanHalfFOV;
+    float JitterSequenceLength;
+    float DeltaTime;
+    float DynamicResChangeFactor;
+    float ViewSpaceToMetersFactor;
+};
+
+float2 TSS_LoadDilatedMotionVector(int2 Pos)
+{
+    return DilatedMotionVectorsTex[Pos].xy;
+}
+
+float TSS_LoadDilatedDepth(int2 Pos)
+{
+    return DilatedDepthTex[Pos];
+}
+
+float3 TSS_LoadInputColor(int2 Pos)
+{
+    return InputColorTex[Pos].rgb;
+}
+
+float TSS_LoadInputDepth(int2 Pos)
+{
+    return InputDepthTex[Pos];
+}
+
+float TSS_LoadReactiveMask(int2 Pos)
+{
+    return ReactiveMaskTex[Pos];
+}
+
+float TSS_LoadTransparencyCompositionMask(int2 Pos)
+{
+    return TransparencyCompositionMaskTex[Pos];
+}
+
+float2 TSS_LoadInputMotionVector(int2 Pos)
+{
+    float2 MV = InputMotionVectorsTex[Pos].xy;
+    float2 UVMV = MV * MotionVectorScale;
+    UVMV -= MotionVectorJitterCancellation;
+    return UVMV;
+}
+
+float TSS_ComputeDepthClip(float2 UVSample, float CurrentDepthSample)
+{
+    float CurrentDepthVS = TSS_GetViewSpaceDepth(CurrentDepthSample, DeviceToViewDepth);
+    TSSBilinearSamplingData BilinearInfo = TSS_GetBilinearSamplingData(UVSample, RenderSize);
+
+    float DepthAccum = 0.0f;
+    float WeightSum = 0.0f;
+
+    for (int i = 0; i < 4; i++)
+    {
+        int2 SamplePos = BilinearInfo.BasePos + BilinearInfo.Offsets[i];
+        if (TSS_IsOnScreen(SamplePos, RenderSize))
+        {
+            float Weight = BilinearInfo.Weights[i];
+            if (Weight > TSS_RECONSTRUCTED_DEPTH_BILINEAR_WEIGHT_THRESHOLD)
+            {
+                float PrevDepth = asfloat(ReconstructedPrevDepthTex[SamplePos]);
+                float PrevDepthVS = TSS_GetViewSpaceDepth(PrevDepth, DeviceToViewDepth);
+                float DepthDiff = CurrentDepthVS - PrevDepthVS;
+
+                if (DepthDiff > 0.0f)
+                {
+                    float PlaneDepth = max(PrevDepth, CurrentDepthSample);
+                    float3 Center = TSS_GetViewSpacePosition(int2(RenderSize * 0.5f), RenderSize, PlaneDepth, DeviceToViewDepth);
+                    float3 Corner = TSS_GetViewSpacePosition(int2(0, 0), RenderSize, PlaneDepth, DeviceToViewDepth);
+
+                    float HalfViewportWidth = length(float2(RenderSize));
+                    float DepthThreshold = max(CurrentDepthVS, PrevDepthVS);
+
+                    float Ksep = 1.37e-05f;
+                    float Kfov = length(Corner) / max(length(Center), 0.0001f);
+                    float RequiredDepthSeparation = Ksep * Kfov * HalfViewportWidth * DepthThreshold;
+
+                    float ResolutionFactor = saturate(length(float2(RenderSize)) / length(float2(1920.0f, 1080.0f)));
+                    float Power = lerp(1.0f, 3.0f, ResolutionFactor);
+                    DepthAccum += pow(saturate(RequiredDepthSeparation / DepthDiff), Power) * Weight;
+                    WeightSum += Weight;
+                }
+            }
+        }
+    }
+
+    return (WeightSum > 0) ? saturate(1.0f - DepthAccum / WeightSum) : 0.0f;
+}
+
+float TSS_ComputeMotionDivergence(int2 PxPos)
+{
+    float MinConvergence = 1.0f;
+    float2 MVNucleus = TSS_LoadInputMotionVector(PxPos);
+    float NucleusVelocityLR = length(MVNucleus * RenderSize);
+    float MaxVelocityUV = length(MVNucleus);
+
+    const float MVVelocityEpsilon = 1e-02f;
+
+    if (NucleusVelocityLR > MVVelocityEpsilon)
+    {
+        for (int y = -1; y <= 1; ++y)
+        {
+            for (int x = -1; x <= 1; ++x)
+            {
+                int2 SP = TSS_ClampLoad(PxPos, int2(x, y), RenderSize);
+                float2 MV = TSS_LoadInputMotionVector(SP);
+                float VelocityUV = length(MV);
+                MaxVelocityUV = max(VelocityUV, MaxVelocityUV);
+                VelocityUV = max(VelocityUV, MaxVelocityUV);
+                MinConvergence = min(MinConvergence, dot(MV / max(VelocityUV, 0.0001f), MVNucleus / max(VelocityUV, 0.0001f)));
+            }
+        }
+    }
+
+    return saturate(1.0f - MinConvergence) * saturate(MaxVelocityUV / 0.01f);
+}
+
+float TSS_ComputeDepthDivergence(int2 PxPos)
+{
+    float MaxDistInMeters = TSS_GetViewSpaceDepth(1.0f, DeviceToViewDepth) * ViewSpaceToMetersFactor;
+    float DepthMax = 0.0f;
+    float DepthMin = MaxDistInMeters;
+    int MaxDistFound = 0;
+
+    for (int y = -1; y < 2; y++)
+    {
+        for (int x = -1; x < 2; x++)
+        {
+            int2 SamplePos = PxPos + int2(x, y);
+            float OnScreenFactor = TSS_IsOnScreen(SamplePos, RenderSize) ? 1.0f : 0.0f;
+            float Depth = TSS_GetViewSpaceDepthInMeters(TSS_LoadDilatedDepth(SamplePos), DeviceToViewDepth, ViewSpaceToMetersFactor) * OnScreenFactor;
+            MaxDistFound |= int(MaxDistInMeters == Depth);
+            DepthMin = min(DepthMin, Depth);
+            DepthMax = max(DepthMax, Depth);
+        }
+    }
+
+    return (1.0f - DepthMin / max(DepthMax, 0.0001f)) * (MaxDistFound ? 0.0f : 1.0f);
+}
+
+float TSS_ComputeTemporalMotionDivergence(int2 PxPos)
+{
+    float2 UV = float2(PxPos + 0.5f) / float2(RenderSize);
+    float2 MV = TSS_LoadDilatedMotionVector(PxPos);
+    float2 ReprojectedUV = UV + MV;
+    ReprojectedUV = TSS_ClampUv(ReprojectedUV, RenderSize, MaxRenderSize);
+    float2 PrevMV = PrevDilatedMotionVectorsTex.SampleLevel(LinearClampSampler, ReprojectedUV, 0).xy;
+
+    float PxDist = length(MV * DisplaySize);
+    return PxDist > 1.0f ? lerp(0.0f, 1.0f - saturate(length(PrevMV) / max(length(MV), 0.0001f)), saturate(pow(PxDist / 20.0f, 3.0f))) : 0;
+}
+
+float TSS_EvaluateSurface(int2 PxPos)
+{
+    float d0 = TSS_GetViewSpaceDepth(asfloat(ReconstructedPrevDepthTex[PxPos + int2(0, -1)]), DeviceToViewDepth);
+    float d1 = TSS_GetViewSpaceDepth(asfloat(ReconstructedPrevDepthTex[PxPos + int2(0, 0)]), DeviceToViewDepth);
+    float d2 = TSS_GetViewSpaceDepth(asfloat(ReconstructedPrevDepthTex[PxPos + int2(0, 1)]), DeviceToViewDepth);
+    return 1.0f - float(((d0 - d1) > (d1 * 0.01f)) && ((d1 - d2) > (d2 * 0.01f)));
+}
+
+void TSS_PreProcessReactiveMasks(int2 PxLrPos, float MotionDivergence)
+{
+    float3 ReferenceColor = TSS_LoadInputColor(PxLrPos);
+    float2 ReactiveFactor = float2(0.0f, MotionDivergence);
+    float MasksSum = 0.0f;
+
+    float3 ColorSamples[9];
+    float ReactiveSamples[9];
+    float TCCompositionSamples[9];
+
+    for (int y = -1; y < 2; y++)
+    {
+        for (int x = -1; x < 2; x++)
+        {
+            int2 SampleCoord = TSS_ClampLoad(PxLrPos, int2(x, y), RenderSize);
+            int SampleIdx = (y + 1) * 3 + x + 1;
+
+            float3 ColorSample = TSS_LoadInputColor(SampleCoord);
+            float ReactiveSample = TSS_LoadReactiveMask(SampleCoord);
+            float TCCompositionSample = TSS_LoadTransparencyCompositionMask(SampleCoord);
+
+            ColorSamples[SampleIdx] = ColorSample;
+            ReactiveSamples[SampleIdx] = ReactiveSample;
+            TCCompositionSamples[SampleIdx] = TCCompositionSample;
+
+            MasksSum += (ReactiveSample + TCCompositionSample);
+        }
+    }
+
+    if (MasksSum > 0)
+    {
+        for (int i = 0; i < 9; i++)
+        {
+            float3 ColorSample = ColorSamples[i];
+            float ReactiveSample = ReactiveSamples[i];
+            float TCCompositionSample = TCCompositionSamples[i];
+
+            float MaxLenSq = max(dot(ReferenceColor, ReferenceColor), dot(ColorSample, ColorSample));
+            float Similarity = dot(ReferenceColor, ColorSample) / max(MaxLenSq, 0.0001f);
+
+            float PowerBiasMax = 6.0f;
+            float SimilarityPower = 1.0f + (PowerBiasMax - Similarity * PowerBiasMax);
+            float WeightedReactive = pow(ReactiveSample, SimilarityPower);
+            float WeightedTCComposition = pow(TCCompositionSample, SimilarityPower);
+
+            ReactiveFactor = max(ReactiveFactor, float2(WeightedReactive, WeightedTCComposition));
+        }
+    }
+
+    DilatedReactiveMasks[PxLrPos] = float4(ReactiveFactor, 0.0f, 0.0f);
+}
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 DTid : SV_DispatchThreadID)
+{
+    int2 PxPos = int2(DTid.xy);
+    if (!TSS_IsOnScreen(PxPos, RenderSize))
+        return;
+
+    float2 DepthUV = (PxPos + 0.5f) / float2(RenderSize);
+    float2 MotionVector = TSS_LoadDilatedMotionVector(PxPos);
+
+    MotionVector *= float(length(MotionVector * DisplaySize) > 0.01f);
+
+    float CurDilatedDepth = TSS_LoadDilatedDepth(PxPos);
+
+    float DepthClip = TSS_ComputeDepthClip(DepthUV + MotionVector, CurDilatedDepth) * TSS_EvaluateSurface(PxPos);
+    float3 PreparedYCoCg = max(float3(0, 0, 0), TSS_LoadInputColor(PxPos));
+    PreparedYCoCg = TSS_PrepareRgb(PreparedYCoCg, 1.0f, PreExposure);
+    PreparedYCoCg = TSS_RGBToYCoCg(PreparedYCoCg);
+    PreparedInputColor[PxPos] = float4(PreparedYCoCg, DepthClip);
+
+    float MotionDivergence = TSS_ComputeMotionDivergence(PxPos);
+    float TemporalMotionDiff = saturate(TSS_ComputeTemporalMotionDivergence(PxPos) - TSS_ComputeDepthDivergence(PxPos));
+
+    TSS_PreProcessReactiveMasks(PxPos, max(TemporalMotionDiff, MotionDivergence));
+}

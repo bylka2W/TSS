@@ -1,0 +1,50 @@
+#include "/Engine/Private/Common.ush"
+#include "TSSCommon.ush"
+
+RWTexture2D<float> LuminanceMip0;
+RWTexture2D<float> LuminanceMip4;
+RWTexture2D<float> LuminanceMip5;
+RWTexture2D<float2> AutoExposure;
+RWTexture2D<uint> SpdAtomicCounter;
+
+Texture2D<float4> InputColor;
+
+cbuffer TSSConstants : register(b0)
+{
+    int2 RenderSize;
+    int2 MaxRenderSize;
+    int2 DisplaySize;
+    int2 InputColorResourceDimensions;
+    int2 LumaMipDimensions;
+    int LumaMipLevelToUse;
+    int FrameIndex;
+    float4 DeviceToViewDepth;
+    float2 Jitter;
+    float2 MotionVectorScale;
+    float2 DownscaleFactor;
+    float2 MotionVectorJitterCancellation;
+    float PreExposure;
+    float PreviousFramePreExposure;
+    float TanHalfFOV;
+    float JitterSequenceLength;
+    float DeltaTime;
+    float DynamicResChangeFactor;
+    float ViewSpaceToMetersFactor;
+};
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 DTid : SV_DispatchThreadID)
+{
+    if (DTid.x >= (uint)RenderSize.x || DTid.y >= (uint)RenderSize.y)
+        return;
+
+    float2 UV = (DTid.xy + 0.5f + Jitter) / float2(RenderSize);
+    UV = TSS_ClampUv(UV, RenderSize, InputColorResourceDimensions);
+
+    float3 RGB = InputColor[uint2(clamp(uint2(UV * InputColorResourceDimensions), 0, InputColorResourceDimensions - 1))].rgb;
+    RGB /= max(PreExposure, 0.0001f);
+
+    float LogLuma = log(max(TSS_EPSILON, TSS_Luminance(RGB)));
+
+    LuminanceMip0[DTid.xy] = LogLuma;
+}
