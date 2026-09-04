@@ -1,0 +1,15 @@
+{
+    "FileVersion": 3,
+    "Version": 1,
+    "VersionName": "0.1.0",
+    "FriendlyName": "TSS",
+    "Description": "TSS GPU image sharpening and upscaling system.",
+    "Category": "Rendering",
+    "Modules": [
+        {
+            "Name": "TSS",
+            "Type": "Runtime",
+            "LoadingPhase": "PostConfigInit"
+        }
+    ]
+}

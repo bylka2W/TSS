@@ -1,0 +1,56 @@
+#include "/Engine/Public/Platform.ush"
+
+Texture2D<float4> InputTexture;
+RWTexture2D<float4> OutputTexture;
+
+SamplerState InputSampler;
+
+float Strength;
+float2 InvTextureSize;
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+    uint2 pixel = DispatchThreadId.xy;
+
+    float2 uv = (float2(pixel) + 0.5) * InvTextureSize;
+
+    float4 center = InputTexture.SampleLevel(
+        InputSampler,
+        uv,
+        0
+    );
+
+    float4 top = InputTexture.SampleLevel(
+        InputSampler,
+        uv + float2(0.0, -InvTextureSize.y),
+        0
+    );
+
+    float4 bottom = InputTexture.SampleLevel(
+        InputSampler,
+        uv + float2(0.0, InvTextureSize.y),
+        0
+    );
+
+    float4 left = InputTexture.SampleLevel(
+        InputSampler,
+        uv + float2(-InvTextureSize.x, 0.0),
+        0
+    );
+
+    float4 right = InputTexture.SampleLevel(
+        InputSampler,
+        uv + float2(InvTextureSize.x, 0.0),
+        0
+    );
+
+    float4 neighborAverage =
+        (top + bottom + left + right) * 0.25;
+
+    float4 detail = center - neighborAverage;
+
+    float4 result = center + detail * Strength;
+
+    OutputTexture[pixel] = saturate(result);
+}
