@@ -2,8 +2,9 @@
 
 #include "CoreMinimal.h"
 #include "GlobalShader.h"
-#include "ShaderParameterStruct.h"
+#include "Modules/ModuleManager.h"
 #include "RenderGraphBuilder.h"
+#include "ShaderParameterStruct.h"
 
 class FTSSSharpenShader : public FGlobalShader
 {
@@ -19,16 +20,20 @@ class FTSSSharpenShader : public FGlobalShader
     END_SHADER_PARAMETER_STRUCT()
 };
 
+TSS_API void AddSharpenPass(
+    FRDGBuilder& GraphBuilder,
+    ERHIFeatureLevel::Type FeatureLevel,
+    FRDGTextureRef InputTexture,
+    FRDGTextureRef OutputTexture,
+    float Strength
+);
+
 class TSS_API FTSSModule : public IModuleInterface
 {
 public:
     virtual void StartupModule() override;
     virtual void ShutdownModule() override;
-};
 
-TSS_API void AddSharpenPass(
-    FRDGBuilder& GraphBuilder,
-    FRDGTextureRef InputTexture,
-    FRDGTextureRef OutputTexture,
-    float Strength
-);
+private:
+    void OnPostEngineInit();
+};

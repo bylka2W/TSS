@@ -1,25 +1,45 @@
 #include "TSS.h"
 
+#include "TSSViewExtension.h"
+
+#include "CoreGlobals.h"
 #include "GlobalShader.h"
-#include "RenderGraphUtils.h"
-#include "ShaderParameterStruct.h"
-#include "RHIStaticStates.h"
-#include "Projects.h"
 #include "Modules/ModuleManager.h"
+#include "Projects.h"
+#include "RenderGraphUtils.h"
+#include "RHIStaticStates.h"
+#include "ShaderParameterStruct.h"
 
 IMPLEMENT_GLOBAL_SHADER(FTSSSharpenShader, "/TSS/TSSSharpen.usf", "MainCS", SF_Compute);
 
 #define LOCTEXT_NAMESPACE "FTSSModule"
+
+TSharedPtr<FTSSViewExtension, ESPMode::ThreadSafe> TSSViewExtension;
 
 void FTSSModule::StartupModule()
 {
     FString PluginBaseDir = IPluginManager::Get().FindPlugin(TEXT("TSS"))->GetBaseDir();
     FString ShaderDir = FPaths::Combine(PluginBaseDir, TEXT("Shaders"));
     AddShaderSourceDirectoryMapping(TEXT("/TSS"), ShaderDir);
+
+    FCoreDelegates::OnPostEngineInit.AddRaw(this, &FTSSModule::OnPostEngineInit);
 }
 
 void FTSSModule::ShutdownModule()
 {
+    FCoreDelegates::OnPostEngineInit.RemoveAll(this);
+    TSSViewExtension.Reset();
+}
+
+void FTSSModule::OnPostEngineInit()
+{
+    UE_LOG(LogTSS, Warning, TEXT("TSS: OnPostEngineInit"));
+
+    TSSViewExtension = FSceneViewExtensions::NewExtension<FTSSViewExtension>();
+
+    UE_LOG(LogTSS, Warning,
+        TEXT("TSS: ViewExtension created=%d"),
+        TSSViewExtension.IsValid() ? 1 : 0);
 }
 
 #undef LOCTEXT_NAMESPACE
@@ -28,12 +48,13 @@ IMPLEMENT_MODULE(FTSSModule, TSS)
 
 void AddSharpenPass(
     FRDGBuilder& GraphBuilder,
+    ERHIFeatureLevel::Type FeatureLevel,
     FRDGTextureRef InputTexture,
     FRDGTextureRef OutputTexture,
     float Strength)
 {
     TShaderMapRef<FTSSSharpenShader> ComputeShader(
-        GetGlobalShaderMap(GMaxRHIFeatureLevel)
+        GetGlobalShaderMap(FeatureLevel)
     );
 
     FTSSSharpenShader::FParameters* PassParameters =

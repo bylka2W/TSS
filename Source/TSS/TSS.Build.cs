@@ -12,7 +12,9 @@ public class TSS : ModuleRules
         PublicDependencyModuleNames.AddRange(
             new string[]
             {
-                "Core"
+                "Core",
+                "CoreUObject",
+                "Engine"
             }
         );
 
@@ -21,6 +23,7 @@ public class TSS : ModuleRules
             {
                 "RenderCore",
                 "RHI",
+                "Renderer",
                 "Projects"
             }
         );

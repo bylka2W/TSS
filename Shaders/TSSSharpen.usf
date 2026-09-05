@@ -13,6 +13,16 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 {
     uint2 pixel = DispatchThreadId.xy;
 
+    uint width;
+    uint height;
+
+    OutputTexture.GetDimensions(width, height);
+
+    if (pixel.x >= width || pixel.y >= height)
+    {
+        return;
+    }
+
     float2 uv = (float2(pixel) + 0.5) * InvTextureSize;
 
     float4 center = InputTexture.SampleLevel(
