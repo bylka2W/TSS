@@ -14,7 +14,7 @@ build_out.txt
 bin/
 build/
 test/
-docs/
+
 
 # Unreal Engine generated
 Binaries/
