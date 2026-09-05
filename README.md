@@ -2,8 +2,6 @@
 
 Плагин для Unreal Engine 5.3. Глобальный compute-шейдер шарпинга через FSceneViewExtension, без патча движка.
 
-## Скриншоты
-
 ### TSS выключен (`r.TSS.Enabled 0`)
 ![TSS OFF](docs/strength_0.0.png)
 
